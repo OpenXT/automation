@@ -1,0 +1,426 @@
+stages:
+  - prepare
+  - build
+  - build_stage2
+  - build_stage3
+  - build_stage4
+  - build_stage5
+  - stage
+  - deploy
+
+variables:
+  # When using dind service we need to instruct docker, to talk with the
+  # daemon started inside of the service. The daemon is available with
+  # a network connection instead of the default /var/run/docker.sock socket.
+  #
+  # The 'docker' hostname is the alias of the service container as described at
+  # https://docs.gitlab.com/ee/ci/docker/using_docker_images.html#accessing-the-services
+  #
+  # Note that if you're using the Kubernetes executor, the variable should be set to
+  # tcp://localhost:2375 because of how the Kubernetes executor connects services
+  # to the job container
+  # DOCKER_HOST: tcp://localhost:2375
+  #
+  # For non-Kubernetes executors, we use tcp://docker:2375
+  # DOCKER_HOST: tcp://docker:2375
+  #
+  # This will instruct Docker not to start over TLS.
+  DOCKER_TLS_CERTDIR: ""
+
+  # Build Variables
+  BORDEL_REPO: "github.com/apertussolutions/bordel.git"
+  BORDEL_BRANCH: "master"
+  MANIFEST_REPO: "github.com/apertussolutions/openxt-manifest.git"
+  MANIFEST_BRANCH: "master"
+  MANIFEST_FILE: "stable-9.xml"
+  DEBUG: "true"
+  BUILD_TYPE: "all"
+  # Final packaging type: iso, pxe or all(not recommended)
+  PACKAGE_TYPE: "iso"
+  GITLAB_HOST: "<gitlab host>"
+  AWS_REGION: "<region>"
+  S3_BUCKET: "openxt"
+  # If you want the build to fail, switch to building individual jobs. The cache
+  # doesn't work very well in this instance, need to figure something else out
+  # for this.
+  #BUILD_TYPE: "piecemeal"
+
+.setup_cm: &setup_cm
+  - aws configure set default.s3.signature_version s3v4
+  - git config --global user.email "you@example.com"
+  - git config --global user.name "Your Name"
+  - git config --global url.https://${GITLAB_HOST}/.insteadOf git://${GITLAB_HOST}/
+  # This is necessary to be able to pull the source from other gitlab projects.
+  # Instead of remapping the URL in the .gitconfig, do it this way so that the old
+  # access tokens don't get permanently attached to the repository's .git/config
+  - echo "machine ${GITLAB_HOST}" > ~/.netrc
+  - echo "login gitlab-ci-token" >> ~/.netrc
+  - echo "password $CI_JOB_TOKEN" >> ~/.netrc
+
+.default-cache: &default-cache
+  key: $CI_COMMIT_SHA
+  paths:
+    - deploy
+
+.pull-push-cache: &pull-push-cache
+  cache:
+    <<: *default-cache
+    policy: pull-push
+
+.pull-cache: &pull-cache
+  cache:
+    <<: *default-cache
+    policy: pull
+
+setup:docker_build_image:
+  image: docker:18-git
+  services:
+    - docker:18-dind
+  stage: prepare
+  variables:
+    DEBUG: ""
+  before_script: *setup_cm
+  script:
+    # Install the awscli python package and have it execute a docker login
+    - apk -q update && apk -qUu add python py-pip && pip install --quiet awscli
+    - eval $(aws ecr get-login --no-include-email --region ${AWS_REGION} --registry-ids ${ECR_ID})
+    # Clone bordel so it can make the docker image
+    - git clone -b ${BORDEL_BRANCH} https://${BORDEL_REPO}
+    - cd bordel
+    # Remove the ENTRYPOINT, this may not be necessary anymore
+    - sed -i -e 's|ENTRYPOINT.*||' Dockerfiles/openxt-oe64
+    - if [[ "x$DEBUG" != "x" ]]; then docker info; fi
+    # Build the openxt-oe64 Dockerfile, push to ECR
+    - docker build -t ${EC2_DOCKER_REGISTRY}/build_image:debian_jessie -f Dockerfiles/jessie/openxt-oe64 .
+    - docker push ${EC2_DOCKER_REGISTRY}/build_image:debian_jessie
+  when: manual
+  #only:
+  #  - master
+  #  - /^stable-.*/
+
+setup:workspace:
+  image: ${EC2_DOCKER_REGISTRY}/build_image:debian_jessie
+  stage: prepare
+  before_script: *setup_cm
+  script:
+    - if [[ "x$DEBUG" != "x" ]]; then env | sort; df -h; fi
+    # Remove the old cache if present, create the new directory structure
+    - rm -rf {deploy,logs,staging}/*
+    - rm -rf openxt-workspace
+    - mkdir -p openxt-workspace
+    - cd openxt-workspace
+    # Set up the sstate
+    - if [ ! -d /cache/sstate/$CI_COMMIT_REF_NAME ]; then mkdir /cache/sstate/${CI_COMMIT_REF_NAME}; fi
+    - ln -s /cache/sstate/${CI_COMMIT_REF_NAME} sstate-cache
+    # Download the sources for building
+    - repo init -u https://${MANIFEST_REPO} -b $MANIFEST_BRANCH --no-clone-bundle -m $MANIFEST_FILE
+    - repo sync --no-clone-bundle
+    - repo start ${CI_COMMIT_REF_NAME} openxt/*
+    # Configure the build
+    - openxt/bordel/bordel -i ${CI_COMMIT_REF_NAME} config -t stable-9 -b ${CI_COMMIT_REF_NAME}
+    # Copy the certs into the workspace
+    - mkdir -p certs && cp -R /certs/* certs/
+    # Update the mirrors
+    - cd build-${CI_COMMIT_REF_NAME}/conf
+    - awk '1;/MIRRORS .*" \\/{print "    http://v3.sk/~lkundrak/dev86/archive/             https://openxt.ainfosec.com/mirror/ \\n \\"}' local.conf > local.conf.new
+    - mv local.conf local.conf.orig
+    - mv local.conf.new local.conf
+    - awk '1;/MIRRORS .*" \\/{print "    https://cgit.freedesktop.org/~airlied/vbetool/snapshot/             https://openxt.ainfosec.com/mirror/ \\n \\"}' local.conf > local.conf.new
+    - mv local.conf local.conf.orig
+    - mv local.conf.new local.conf
+    - awk '1;/MIRRORS .*" \\/{print "    http://www.ivmaisoft.com/_bin/atomic_ops/             https://ftp.osuosl.org/pub/blfs/conglomeration/libatomic/ \\n \\"}' local.conf > local.conf.new
+    - mv local.conf local.conf.orig
+    - mv local.conf.new local.conf
+  artifacts:
+    paths:
+      - openxt-workspace/
+    when: always
+    expire_in: 3 days
+  only:
+    variables:
+      - $BUILD_TYPE != ""
+
+.build_template: &build_definition  # Template for building images
+  <<: *pull-push-cache
+  image: ${EC2_DOCKER_REGISTRY}/build_image:debian_jessie
+  stage: build
+  before_script: *setup_cm
+  script:
+    - cd openxt-workspace
+    - DEPLOY_DIR=build-${CI_COMMIT_REF_NAME}/deploy
+    # Remove any old build/deploy dir contents
+    - rm -rf ${DEPLOY_DIR}
+    - mkdir -p ${DEPLOY_DIR}
+    # Update the build/deploy directory with any cached contents
+    - if [[ -d "../deploy/images" ]]; then mv ../deploy/images ${DEPLOY_DIR}; fi
+    - if [[ "x$DEBUG" != "x" ]]; then ls -al build-${CI_COMMIT_REF_NAME}; ls -al ..; fi
+    # Update all the sources we're going to build, then build it
+    - repo sync --no-clone-bundle
+    - echo "openxt/bordel/bordel -i ${CI_COMMIT_REF_NAME} build \"$IMAGE_TO_BUILD\""
+    - openxt/bordel/bordel -i ${CI_COMMIT_REF_NAME} build "$IMAGE_TO_BUILD"
+  after_script:
+    - BUILD_DIR=openxt-workspace/build-${CI_COMMIT_REF_NAME}
+    # Ensure we have the log and deploy directories for caching
+    - mkdir -p deploy logs/${CI_JOB_NAME}
+    # Preserve the cooker logs
+    - cp -RP ${BUILD_DIR}/tmp-glibc/log/cooker/* logs/${CI_JOB_NAME}
+    # Check the cooker logs, the full path to any failed job logfile will be listed there.
+    - FAILURE=$(grep -r "Logfile of failure" logs/${CI_JOB_NAME}/*) || true
+    - |
+      if [[ -n "$FAILURE" ]]; then
+        FAILED_FILE=( $FAILURE );
+        cp ${FAILED_FILE[-1]} logs;
+      fi
+    # Get rid of the tmp* directories, they're too large
+    - rm -rf ${BUILD_DIR}/tmp-glibc
+    # Save off the deploy directory
+    - cp -r ${BUILD_DIR}/deploy/* deploy/
+  dependencies:
+    - setup:workspace
+  artifacts:
+    paths:
+      - logs
+    when: always
+    expire_in: 2 days
+  only:
+    variables:
+      - $BUILD_TYPE == "piecemeal"
+
+build:dom0:initramfs:
+  <<: *build_definition
+  variables:
+    IMAGE_TO_BUILD: "xenclient-dom0 xenclient-initramfs-image"
+
+build:stubdomain:initramfs:
+  <<: *build_definition
+  stage: build_stage2
+  variables:
+    IMAGE_TO_BUILD: "xenclient-stubdomain xenclient-stubdomain-initramfs-image"
+
+build:installer:image:
+  <<: *build_definition
+  stage: build_stage3
+  variables:
+    IMAGE_TO_BUILD: "openxt-installer xenclient-installer-image"
+
+build:installer:image:part2:
+  <<: *build_definition
+  stage: build_stage4
+  variables:
+    IMAGE_TO_BUILD: "openxt-installer xenclient-installer-part2-image"
+
+build:dom0:image:
+  <<: *build_definition
+  stage: build_stage5
+  variables:
+    IMAGE_TO_BUILD: "xenclient-dom0 xenclient-dom0-image"
+  dependencies:
+    - setup:workspace
+    - build:dom0:initramfs
+    - build:stubdomain:initramfs
+
+build:upgrade:image:
+  <<: *build_definition
+  stage: build_stage5
+  variables:
+    IMAGE_TO_BUILD: "upgrade-compat xenclient-upgrade-compat-image"
+
+build:uivm:image:
+  <<: *build_definition
+  stage: build_stage5
+  variables:
+    IMAGE_TO_BUILD: "xenclient-uivm xenclient-uivm-image"
+
+build:ndvm:image:
+  <<: *build_definition
+  stage: build_stage5
+  variables:
+    IMAGE_TO_BUILD: "xenclient-ndvm xenclient-ndvm-image"
+
+build:syncvm:image:
+  <<: *build_definition
+  stage: build_stage5
+  variables:
+    IMAGE_TO_BUILD: "xenclient-syncvm xenclient-syncvm-image"
+
+.build_all: &build_all
+  <<: *build_definition
+  after_script:
+    - BUILD_DIR=openxt-workspace/build-${CI_COMMIT_REF_NAME}
+    # Remove any old cached files
+    - rm -rf deploy logs
+    - mkdir deploy logs
+    # Preserve the cooker logs
+    - cp -RP ${BUILD_DIR}/tmp-glibc/log/cooker/* logs
+    # Check the cooker logs, the full path to any failed job logfile will be listed there.
+    - FAILURE=$(grep -r "Logfile of failure" logs/*) || true
+    - |
+      if [[ -n "$FAILURE" ]]; then
+        FAILED_FILE=( $FAILURE );
+        cp ${FAILED_FILE[-1]} logs;
+      fi
+    # Get rid of the tmp* directories, they're too large
+    - rm -rf ${BUILD_DIR}/tmp-glibc
+    # Save all the work from the deploy directory
+    - mv ${BUILD_DIR}/deploy/* deploy/
+  cache:
+    key: $CI_COMMIT_SHA
+    paths:
+      - deploy
+    policy: push
+  only:
+    variables:
+      - $BUILD_TYPE == "all"
+
+build:all:
+  <<: *build_all
+  variables:
+    IMAGE_TO_BUILD: ""
+
+build:all:clean:
+  <<: *build_all
+  variables:
+    IMAGE_TO_BUILD: "clean"
+  when: manual
+
+.stage_template: &stage_definition  # Template for creating images
+  <<: *pull-cache
+  image: ${EC2_DOCKER_REGISTRY}/build_image:debian_jessie
+  stage: stage
+  variables:
+    DEBUG: ""
+  before_script: *setup_cm
+  script:
+    - BUILD_DIR=build-${CI_COMMIT_REF_NAME}
+    # Remove the old log artifacts
+    - rm -rf logs
+    - cd openxt-workspace
+    # Update the build/deploy directory with any cached contents
+    - if [[ "x$DEBUG" != "x" ]]; then ls -al ${BUILD_DIR}; ls -al ..; fi
+    - rm -rf ${BUILD_DIR}/deploy
+    - mkdir -p ${BUILD_DIR}/deploy
+    - mv ../deploy/images ${BUILD_DIR}/deploy
+    - if [[ "x$DEBUG" != "x" ]]; then ls -al ${BUILD_DIR}/deploy/; fi
+    # Update all the sources, mainly for any bordel changes. Then run the stage command
+    - repo sync --no-clone-bundle
+    - echo "openxt/bordel/bordel -i ${CI_COMMIT_REF_NAME} stage \"$IMAGE_TO_BUILD\""
+    - openxt/bordel/bordel -i ${CI_COMMIT_REF_NAME} stage "$IMAGE_TO_BUILD"
+    # Run the deploy commands, append $PXE_VARS in case the pxe target is run manually
+    - echo "openxt/bordel/bordel -i ${CI_COMMIT_REF_NAME} deploy \"$IMAGE_TO_BUILD\" \"$PXE_VARS\""
+    - openxt/bordel/bordel -i ${CI_COMMIT_REF_NAME} deploy "$IMAGE_TO_BUILD" "$PXE_VARS"
+  after_script:
+    - BUILD_DIR=openxt-workspace/build-${CI_COMMIT_REF_NAME}
+    - if [[ "x$DEBUG" != "x" ]]; then ls -l $BUILD_DIR/deploy/*; fi
+    # Save the iso to its own directory if that was one of the targets
+    - |
+        if [[ "${IMAGE_TO_BUILD}" == *"iso"* ]]; then
+          mkdir -p deploy/iso;
+          cp -f ${BUILD_DIR}/deploy/*.iso deploy/iso;
+        fi
+    # Preserve the contents of the deploy directory
+    - cp -Rf ${BUILD_DIR}/deploy/* deploy/
+    - if [[ "x$DEBUG" != "x" ]]; then ls -l deploy/*; fi
+  dependencies:
+    - setup:workspace
+    - build:dom0:image
+    - build:upgrade:image
+    - build:uivm:image
+    - build:ndvm:image
+    - build:syncvm:image
+  artifacts:
+    paths:
+      - deploy/iso
+    when: always
+    expire_in: 2 days
+
+stage:iso:
+  <<: *stage_definition
+  variables:
+    IMAGE_TO_BUILD: "iso"
+  only:
+    variables:
+      - $PACKAGE_TYPE == "iso"
+
+stage:pxe:
+  <<: *stage_definition
+  variables:
+    IMAGE_TO_BUILD: "pxe"
+  only:
+    variables:
+      - $PACKAGE_TYPE == "pxe"
+
+stage:all:
+  <<: *stage_definition
+  variables:
+    IMAGE_TO_BUILD: "iso pxe repository"
+  before_script: *setup_cm
+  dependencies:
+    - setup:workspace
+    - build:all
+  only:
+    variables:
+      - $PACKAGE_TYPE == "all"
+
+.deploy_template: &deploy_definition  # Template for saving the iso to S3
+  image: alpine:latest
+  stage: deploy
+  before_script:
+    # Install the coreutils package and awscli python package, this enables easy upload to S3
+    - apk -q update && apk -qUu add py-pip && pip install --quiet awscli
+  script:
+    - if [[ "x$DEBUG" != "x" ]]; then echo "ls -al deploy"; ls -lR deploy/; fi
+    # Upload the iso to a directory named after today and the branch. Make it expire in $NUM_DAYS_TO_EXPIRE days, defaults to 30
+    - |
+      if [[ -d deploy/iso ]]; then
+        let EXPIRE_HOURS=$NUM_DAYS_TO_EXPIRE*24;
+        EXPIRATION_DATE=`date -d "$EXPIRE_HOURS:00:00" -I`;
+        TODAY=`date -I`;
+        aws s3 cp deploy/iso/* s3://${S3_BUCKET}/iso/$TODAY/$CI_COMMIT_REF_NAME/ --sse-kms-key-id $AWS_S3_ISO_KEY_ID --sse aws:kms --expires $EXPIRATION_DATE;
+      fi
+
+deploy:iso:
+  <<: *deploy_definition
+  dependencies:
+    - setup:workspace
+    - stage:iso
+  only:
+    variables:
+      - $PACKAGE_TYPE == "iso"
+
+deploy:all:
+  <<: *deploy_definition
+  dependencies:
+    - setup:workspace
+    - stage:all
+  only:
+    variables:
+      - $PACKAGE_TYPE == "all"
+
+cleanup:sstate:kernel:
+  image: debian:latest
+  stage: prepare
+  script:
+    # Force delete of all kernel and out of tree modules, used for the case where modules aren't signed correctly
+    - find /cache/sstate/${CI_COMMIT_REF_NAME} -name "*kernel*" -delete
+    - find /cache/sstate/${CI_COMMIT_REF_NAME} -name "*argo-module*" -delete
+    - find /cache/sstate/${CI_COMMIT_REF_NAME} -name "*txt-info-module*" -delete
+    - find /cache/sstate/${CI_COMMIT_REF_NAME} -name "*linux-openxt*" -delete
+  when: manual
+
+cleanup:sstate:prune:
+  image: debian:latest
+  stage: prepare
+  script:
+    # Delete anything that has not been accessed in 4 days
+    - find /cache/sstate/${CI_COMMIT_REF_NAME} -type f -atime +4 -delete
+    - find /cache/sstate/${CI_COMMIT_REF_NAME} -type d -atime +4 -empty -exec rm -rf {} \;
+  when: manual
+
+cleanup:sstate:all:
+  image: debian:latest
+  stage: prepare
+  script:
+    # Delete all cache for this branch
+    - rm -rf /cache/sstate/${CI_COMMIT_REF_NAME}/*
+  when: manual
+
